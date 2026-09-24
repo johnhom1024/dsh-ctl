@@ -61,13 +61,25 @@ cmd_status() {
   echo "== 端口 $PORT =="
   if pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) && [ -n "$pid" ]; then
     ps -o pid,ppid,lstart,command -p "$pid" | cut -c1-160
-    owner_ppid=$(ps -o ppid= -p "$pid" | tr -d ' ')
-    if [ "$owner_ppid" = "1" ]; then echo "  归属: launchd（正确）"; else echo "  归属: ppid=${owner_ppid} 非 launchd，异常，考虑 dsh-ctl adopt"; fi
+    # pnpm dlx 模式下监听进程是 launchd 的孙进程，需沿父链向上找
+    local chain="$pid" p="$pid" ok=0
+    for _ in 1 2 3 4 5; do
+      p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+      [ -z "$p" ] && break
+      [ "$p" = "1" ] && { ok=1; break; }
+      chain+=" → $p"
+    done
+    if [ "$ok" = "1" ]; then
+      echo "  归属: launchd（正确，进程链 $chain）"
+    else
+      echo "  归属: 非 launchd（链 $chain），异常，考虑 dsh-ctl adopt"
+    fi
   else
     echo "  无进程监听"
   fi
   if [ -f "$LOG" ]; then
-    v=$(grep -oE 'dsh web [0-9][^ ]*|@deepseek-ai/dsh@[0-9][^ ]*' "$LOG" | tail -1)
+    # pipefail 下 grep 无匹配会杀退脚本，必须兜底
+    v=$(grep -oE 'dsh web [0-9][^ ]*|@deepseek-ai/dsh@[0-9][^ ]*' "$LOG" | tail -1) || v=""
     echo "== 日志 == ${LOG}（版本提示: ${v:-未见}）"
   fi
 }
