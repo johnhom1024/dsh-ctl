@@ -1,0 +1,237 @@
+#!/bin/bash
+# dsh-ctl — Mac 本机 dsh web 的统一控制面（launchd 之上的薄封装）
+#
+# 进程模型：dsh web 由 LaunchAgent（LABEL）持有（PPID=1，归 launchd），
+# 任何 agent / 终端 / GUI 退出都带不走它。本脚本是唯一推荐的控制入口。
+#
+# 常用命令：
+#   dsh-ctl status     状态（launchd job + 端口 + 版本）
+#   dsh-ctl url        打印当前带 token 的访问 URL（浏览器/宿主直连用）
+#   dsh-ctl open       用默认浏览器打开 token URL
+#   dsh-ctl log        tail -f dsh web 日志
+#   dsh-ctl start      启动（bootstrap LaunchAgent）
+#   dsh-ctl stop       真停（bootout，不会被拉回）
+#   dsh-ctl restart    重启（kickstart -k）
+#   dsh-ctl upgrade    清 pnpm filtered 元数据缓存后重启（dlx 重新解析 @latest）
+#   dsh-ctl adopt      把当前宿主拉起的 3080 切换到 launchd 接管（一次性迁移）
+#   dsh-ctl install    写入/修复 LaunchAgent plist（幂等）
+#   dsh-ctl port [N]   查看端口；port N 改端口（重写 plist + 重启生效）
+
+set -euo pipefail
+
+LABEL="cn.${USER}.dsh-web"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+LOG="$HOME/Library/Logs/dsh-web.log"
+# 端口真相源是 plist（可能被手动改过，如 3080→3082），环境变量可覆盖，兜底 3080
+PORT="${DSH_CTL_PORT:-$(grep -A1 -m1 -- '--port</string>' "$PLIST" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)}"
+: "${PORT:=3080}"
+DOMAIN="gui/$(id -u)"
+# 2026-09-05 定位的坑：pnpm 11 dlx 解析 @latest 读 metadata-full-filtered 快照，
+# etag 304 会把 dist-tags 钉死在旧版本；升级前必须清。
+NPM_MIRROR_META="$HOME/Library/Caches/pnpm/v11/metadata-full-filtered/registry.npmmirror.com/@deepseek-ai/dsh.jsonl"
+NPM_OFFICIAL_META="$HOME/Library/Caches/pnpm/v11/metadata-full-filtered/registry.npmjs.org/@deepseek-ai/dsh.jsonl"
+
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+need_job() {
+  if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    echo "LaunchAgent $LABEL 未加载。先执行: dsh-ctl install && dsh-ctl start" >&2
+    exit 1
+  fi
+}
+
+cmd_status() {
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    echo "== launchd job: $LABEL =="
+    launchctl print "$DOMAIN/$LABEL" | grep -E '^\s+(state|pid|runs|last exit)' || true
+  else
+    echo "== launchd job: $LABEL 未加载 =="
+  fi
+  echo "== 端口 $PORT =="
+  if pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) && [ -n "$pid" ]; then
+    ps -o pid,ppid,lstart,command -p "$pid" | cut -c1-160
+    owner_ppid=$(ps -o ppid= -p "$pid" | tr -d ' ')
+    if [ "$owner_ppid" = "1" ]; then echo "  归属: launchd（正确）"; else echo "  归属: ppid=${owner_ppid} 非 launchd，异常，考虑 dsh-ctl adopt"; fi
+  else
+    echo "  无进程监听"
+  fi
+  if [ -f "$LOG" ]; then
+    v=$(grep -oE 'dsh web [0-9][^ ]*|@deepseek-ai/dsh@[0-9][^ ]*' "$LOG" | tail -1)
+    echo "== 日志 == ${LOG}（版本提示: ${v:-未见}）"
+  fi
+}
+
+token_url() {
+  grep -oE "http://127\.0\.0\.1:${PORT}/\?token=[^ \"']+" "$LOG" 2>/dev/null | tail -1
+}
+
+cmd_url() {
+  local u; u="$(token_url)"
+  if [ -z "$u" ]; then
+    echo "日志里没有 token URL（服务未启动或日志轮换）。dsh-ctl status 检查。" >&2
+    exit 1
+  fi
+  echo "$u"
+}
+
+cmd_open() { open "$(cmd_url)"; }
+
+cmd_log() { touch "$LOG"; exec tail -f "$LOG"; }
+
+cmd_start() {
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    echo "已在加载，kickstart"; launchctl kickstart "$DOMAIN/$LABEL"
+  else
+    [ -f "$PLIST" ] || cmd_install
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+  fi
+}
+
+cmd_stop() {
+  need_job
+  launchctl bootout "$DOMAIN/$LABEL"
+  # bootout 发 SIGTERM；残留监听再兜底
+  sleep 1
+  if pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) && [ -n "$pid" ]; then
+    echo "bootout 后 ${PORT} 仍有监听（pid ${pid}），SIGKILL 兜底"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  echo "已停止（真停，不会被拉回）"
+}
+
+cmd_restart() { need_job; launchctl kickstart -k "$DOMAIN/$LABEL"; echo "已重启（kickstart -k）"; }
+
+cmd_upgrade() {
+  for f in "$NPM_MIRROR_META" "$NPM_OFFICIAL_META"; do
+    if [ -f "$f" ]; then rm -f "$f"; echo "cleared: ${f#$HOME/}"; fi
+  done
+  cmd_restart
+  echo "dlx 将重新解析 @deepseek-ai/dsh@latest（npmmirror 滞后时可等几分钟再试）"
+}
+
+cmd_port() {
+  if [ -z "${1:-}" ]; then
+    echo "当前端口: ${PORT}"
+    return 0
+  fi
+  case "$1" in
+    *[!0-9]*|'') echo "端口必须是数字: $1" >&2; exit 1 ;;
+  esac
+  if [ "$1" = "$PORT" ]; then
+    echo "端口已是 $1，无需修改"
+    return 0
+  fi
+  sed -i '' "s|<string>${PORT}</string>$|<string>$1</string>|" "$PLIST"
+  plutil -lint "$PLIST" >/dev/null || { echo "plist 损坏，请手动检查 $PLIST" >&2; exit 1; }
+  PORT="$1"
+  echo "plist 已改为端口 $1，重启服务生效…"
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$DOMAIN/$LABEL"
+    sleep 1
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+  else
+    echo "（LaunchAgent 未加载，下次 start 时生效）"
+  fi
+  sleep 4
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
+    echo "端口 $PORT 已监听。新 URL："
+    grep -oE "http://127\.0\.0\.1:${PORT}/\?token=[^ \"']+" "$LOG" 2>/dev/null | tail -1 || true
+  else
+    echo "端口 $PORT 尚未监听，稍后用 dsh-ctl status / url 检查" >&2
+  fi
+}
+
+cmd_install() {
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${HOME}/Library/pnpm/pnpm</string>
+        <string>--config.dangerouslyAllowAllBuilds=true</string>
+        <string>dlx</string>
+        <string>@deepseek-ai/dsh@latest</string>
+        <string>web</string>
+        <string>--no-open</string>
+        <string>--port</string>
+        <string>${PORT}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${HOME}/.hermes/node/bin:${HOME}/Library/pnpm:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>${HOME}</string>
+    </dict>
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>CrashOnHostWake</key>
+        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>${LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG}</string>
+</dict>
+</plist>
+PLISTEOF
+  plutil -lint "$PLIST"
+  echo "已写入 $PLIST"
+}
+
+cmd_adopt() {  echo "adopt：把 3080 从宿主/其他父进程切换到 launchd。"
+  echo "步骤：1) bootout（若有）2) 杀当前 3080 3) bootstrap。浏览器会话会断线，重连即可。"
+  if pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) && [ -n "$pid" ]; then
+    ppid=$(ps -o ppid= -p "$pid" | tr -d ' ')
+    pcomm=$(ps -o comm= -p "$ppid" 2>/dev/null)
+    echo "当前 3080: pid=${pid} ppid=${ppid} (${pcomm})"
+    if [ "$ppid" != "1" ]; then
+      read -r -p "杀掉它并让 launchd 接管？[y/N] " ans
+      [ "$ans" = "y" ] || { echo "放弃"; exit 0; }
+    fi
+  fi
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 && launchctl bootout "$DOMAIN/$LABEL" || true
+  [ -f "$PLIST" ] || cmd_install
+  # 杀整条进程链（dlx 的 node 父进程也要死，否则 KeepAlive 语义错乱）
+  for p in $(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null); do
+    pp=$(ps -o ppid= -p "$p" | tr -d ' ')
+    kill "$p" 2>/dev/null || true
+    [ -n "$pp" ] && [ "$pp" != "1" ] && kill "$pp" 2>/dev/null || true
+  done
+  sleep 1
+  launchctl bootstrap "$DOMAIN" "$PLIST"
+  sleep 6
+  cmd_status
+}
+
+case "${1:-status}" in
+  status)  cmd_status ;;
+  url)     cmd_url ;;
+  open)    cmd_open ;;
+  log)     cmd_log ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  upgrade) cmd_upgrade ;;
+  adopt)   cmd_adopt ;;
+  install) cmd_install ;;
+  port)    cmd_port "${2:-}" ;;
+  help|-h|--help) usage 0 ;;
+  *) echo "未知命令: $1" >&2; usage 1 ;;
+esac
