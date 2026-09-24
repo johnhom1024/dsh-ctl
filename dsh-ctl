@@ -213,8 +213,8 @@ reload_and_wait() {
 }
 
 cmd_port() {
-  if [ -z "${1:-}" ]; then
-    echo "当前端口: ${PORT}"
+  if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+    echo "用法: dsh-ctl port [N]   （N 为数字端口，如 3080；当前 ${PORT}）"
     return 0
   fi
   case "$1" in
@@ -238,8 +238,9 @@ current_channel() {
 cmd_channel() {
   local cur; cur="$(current_channel)"
   cur="${cur:-latest}"
-  if [ -z "${1:-}" ]; then
-    echo "当前通道: ${cur}"
+  if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+    echo "用法: dsh-ctl channel [latest|next|<版本号>]   （当前 ${cur}）"
+    echo "可用通道: $(npm view @deepseek-ai/dsh dist-tags 2>/dev/null | tr -d "'" | tr -d '\n' | sed 's/ *{ *//;s/ *} *//') "
     return 0
   fi
   case "$1" in
@@ -248,6 +249,16 @@ cmd_channel() {
   if [ "$1" = "$cur" ]; then
     echo "通道已是 ${1}，无需修改"
     return 0
+  fi
+  # 写 plist 前校验通道/版本真实存在，防手滑写入非法值让服务崩循环
+  local tags
+  tags=$(npm view @deepseek-ai/dsh dist-tags --json 2>/dev/null) || tags=""
+  if ! grep -q "\"$1\"" <<<"$tags"; then
+    if ! npm view "@deepseek-ai/dsh@$1" version >/dev/null 2>&1; then
+      echo "通道或版本不存在: $1" >&2
+      echo "可用通道: $(tr -d '"' <<<"$tags" | tr -d ' \n' | sed 's/{//;s/}//')" >&2
+      exit 1
+    fi
   fi
   sed -i '' "s|@deepseek-ai/dsh@${cur}</string>|@deepseek-ai/dsh@${1}</string>|" "$PLIST"
   plutil -lint "$PLIST" >/dev/null || { echo "plist 损坏，请手动检查 $PLIST" >&2; exit 1; }
