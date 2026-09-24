@@ -130,9 +130,9 @@ cmd_status() {
       chain+=" → $p"
     done
     if [ "$ok" = "1" ]; then
-      echo "  归属: launchd（正确，进程链 $chain）"
+      echo "  归属: launchd（正确，进程链 ${chain}）"
     else
-      echo "  归属: 非 launchd（链 $chain），异常，考虑 dsh-ctl adopt"
+      echo "  归属: 非 launchd（链 ${chain}），异常，考虑 dsh-ctl adopt"
     fi
   else
     echo "  无进程监听"
