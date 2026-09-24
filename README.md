@@ -7,7 +7,7 @@ Mac 本机 dsh web 服务的命令行控制面
 
 一条命令管理 launchd 常驻的 dsh web · 断线自动拉回 · 改端口不用手编 plist
 
-[快速开始](#-快速开始) · [命令](#-命令) · [English](README.en.md)
+[快速开始](#-快速开始) · [命令](#-命令) · [SKILL.md](SKILL.md)（给 AI agent 的使用指南） · [English](README.en.md)
 
 </div>
 
