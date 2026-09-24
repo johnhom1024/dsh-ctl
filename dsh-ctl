@@ -138,10 +138,13 @@ cmd_status() {
   else
     echo "  无进程监听"
   fi
-  # dsh web 日志不打版本号；版本藏在监听进程的 dlx 缓存路径里
+  # dsh web 日志不打版本号；从监听进程的 dlx 缓存目录 package.json 读
   local v=""
   if [ -n "${pid:-}" ]; then
-    v=$(ps -o command= -p "$pid" 2>/dev/null | grep -oE '@deepseek-ai\+dsh@[0-9][0-9a-zA-Z.+-]+' | head -1 | sed 's/.*@//') || v=""
+    local cmd
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null) || cmd=""
+    dsh_dir=$(grep -oE '/[^ ]*/@deepseek-ai/dsh[^/ ]*' <<<"$cmd" | head -1) || dsh_dir=""
+    [ -n "$dsh_dir" ] && v=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$dsh_dir/package.json" 2>/dev/null | head -1) || v=""
   fi
   if [ -f "$LOG" ] && [ -z "$v" ]; then
     v=$(grep -oE 'dsh web [0-9][^ ]*|@deepseek-ai/dsh@[0-9][^ ]*' "$LOG" | tail -1) || v=""
