@@ -21,6 +21,7 @@ dsh web 不是普通前台进程，由 **LaunchAgent `cn.${USER}.dsh-web`** 持�
 - plist：`~/Library/LaunchAgents/cn.${USER}.dsh-web.plist`（**端口/通道/自启的唯一真相源**）
 - 日志：`~/Library/Logs/dsh-web.log`
 - 默认端口 3080，以 plist 为准（`dsh-ctl port` 查看）
+- 环境变量：`DSH_CTL_PORT` 覆盖端口；`DSH_CTL_LABEL` / `DSH_CTL_LOG` 覆盖 label / 日志路径（起隔离实例测试用）
 
 ## 命令速查
 
@@ -34,6 +35,8 @@ dsh web 不是普通前台进程，由 **LaunchAgent `cn.${USER}.dsh-web`** 持�
 | 启动 / 真停 / 重启 | `dsh-ctl start` / `stop` / `restart` |
 | 改端口 | `dsh-ctl port 3080`（改 plist + 重载 + 打印新 URL） |
 | 切发布通道 | `dsh-ctl channel next`（或 latest / 具体版本号） |
+| 升级到通道最新版 | `dsh-ctl upgrade`（清 dlx 缓存 + 预下载验证 + 重启 + 回读校验） |
+| 升/降到指定版本 | `dsh-ctl upgrade 0.1.6`（钉住通道；`--force` 可强制回退） |
 | 开机自启 | `dsh-ctl autostart on/off`（默认 on） |
 | 修复/重写 plist | `dsh-ctl install`（幂等） |
 | 手动进程迁到 launchd | `dsh-ctl adopt`（交互确认） |
@@ -47,15 +50,21 @@ dsh web 不是普通前台进程，由 **LaunchAgent `cn.${USER}.dsh-web`** 持�
 4. 还不行 → `dsh-ctl log` 看日志报错
 
 **用户要升级/换 next 通道尝鲜：**
-`dsh-ctl channel next`（写 plist 前会向 npm 校验通道存在；首次拉新版本依赖冷启动可达 1 分钟，命令内置等待窗口，提示"尚未监听"不代表失败，等十几秒再 `status`）
+- 升级当前通道：`dsh-ctl upgrade`。它对比 npmjs 官方 dist-tags 定目标（本机是镜像时以官方为准），清掉 pnpm 过期元数据缓存，预下载并验证新版本可运行后才重启，最后回读监听进程版本确认。目标不比当前新时拒绝（防误降级），确要回退用 `upgrade <版本号> --force`
+- 换通道：`dsh-ctl channel next`（写 plist 前会向 npm 校验通道存在；首次拉新版本依赖冷启动可达 1 分钟，命令内置等待窗口，提示"尚未监听"不代表失败，等十几秒再 `status`）
+
+**在 dsh 网页会话内被要求升级 dsh（当前会话跑在被升级的服务里）：**
+`dsh-ctl upgrade` 会检测到自身在服务进程树内，改为延时 3 秒异步重启并先打印后事交代——**这是设计行为，不是卡住**。本会话断线属正常，让用户刷新重连后用 `dsh-ctl status` 看版本、`dsh-ctl url` 拿新地址。
 
 **用户要在别处打开 dsh：**
 `dsh-ctl url` 拿带 token 的地址给用户（token 每次重启都变，别缓存旧 URL）
 
 ## 关键坑点
 
+- **改 plist 不等于生效**：`restart`（kickstart -k）**不重读** plist，用的是 launchd 内存里的 argv；`port`/`channel`/`autostart` 命令内部已做 bootout+bootstrap 重载，别手动改 plist 后只 restart。`upgrade` 会自动检测内存 argv 与 plist 通道不一致并改用重载，无需手工干预
+- **pnpm dlx 元数据缓存陷阱（假升级根因）**：dlx 解析 `@latest` 读 `~/Library/Caches/pnpm` 下 `*metadata*/@deepseek-ai/dsh.jsonl` 缓存，镜像滞后副本 + etag 304 会让 dist-tags 快照永不刷新——直接 restart 升不上去。`upgrade` 已内置清理，手动排查时先删这些文件再重启
+- **版本比较别用 `sort -V`**：它认为 `0.1.5-rc.3 > 0.1.5`（正式版应更大）。脚本内置 `ver_cmp` 处理预发布，agent 手写比较时注意同坑
 - **token 只在日志里**：服务启动时随机生成、只打到 stdout（被 launchd 收进日志）。`url` 命令就是从日志 tail 最新一条。日志被清则取不到，重启服务即重新生成
-- **改 plist 不等于生效**：`restart`（kickstart -k）**不重读** plist；`port`/`channel`/`autostart` 命令内部已做 bootout+bootstrap 重载，别手动改 plist 后只 restart
 - **别凭记忆写端口**：端口真相源是 plist，先 `dsh-ctl port` 读当前值
 - **`channel -h` 之类参数**：`-` 开头参数会被当帮助处理，不会写进 plist；切通道前有 npm dist-tags 校验，不存在的通道直接拒绝
 - **服务未加载时**：`stop`/`restart` 会报错提示先 `install && start`，属正常防护

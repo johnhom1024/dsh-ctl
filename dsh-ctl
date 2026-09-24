@@ -16,20 +16,24 @@
 #   dsh-ctl install    写入/修复 LaunchAgent plist（幂等）
 #   dsh-ctl port [N]   查看端口；port N 改端口（重写 plist + 重启生效）
 #   dsh-ctl channel    查看/切换发布通道（latest / next / 具体版本号）
+#   dsh-ctl upgrade [--force] [版本号]  升级到通道最新版（清 dlx 缓存 + 预下载验证 + 重启校验）
 #   dsh-ctl doctor     环境自检（node/包管理器/plist/launchd/端口/token）
 #   dsh-ctl autostart [on|off]  开机自启开关（默认 on）
+#
+# 环境变量：DSH_CTL_PORT 覆盖端口；DSH_CTL_LABEL / DSH_CTL_LOG 覆盖 label / 日志（隔离测试用）
 
 set -euo pipefail
 
-LABEL="cn.${USER}.dsh-web"
+LABEL="${DSH_CTL_LABEL:-cn.${USER}.dsh-web}"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-LOG="$HOME/Library/Logs/dsh-web.log"
+# 日志文件名跟随 label（主 label 仍是 dsh-web.log，兼容旧路径）
+LOG="${DSH_CTL_LOG:-$HOME/Library/Logs/${LABEL##*.}.log}"
 # 端口真相源是 plist（可能被手动改过，如 3080→3082），环境变量可覆盖，兜底 3080
 PORT="${DSH_CTL_PORT:-$(grep -A1 -m1 -- '--port</string>' "$PLIST" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)}"
 : "${PORT:=3080}"
 DOMAIN="gui/$(id -u)"
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # doctor：逐项体检，OK/WARN/FAIL 一目了然；返回码 0=全绿 1=有 FAIL
 cmd_doctor() {
@@ -139,14 +143,9 @@ cmd_status() {
   else
     echo "  无进程监听"
   fi
-  # dsh web 日志不打版本号；从监听进程的 dlx 缓存目录 package.json 读
+  # dsh web 日志不打版本号；从监听进程的 dlx 缓存目录 package.json 读（与 upgrade 共用 running_version）
   local v=""
-  if [ -n "${pid:-}" ]; then
-    local cmd
-    cmd=$(ps -o command= -p "$pid" 2>/dev/null) || cmd=""
-    dsh_dir=$(grep -oE '/[^ ]*/@deepseek-ai/dsh[^/ ]*' <<<"$cmd" | head -1) || dsh_dir=""
-    [ -n "$dsh_dir" ] && v=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$dsh_dir/package.json" 2>/dev/null | head -1) || v=""
-  fi
+  v="$(running_version)" || v=""
   if [ -f "$LOG" ] && [ -z "$v" ]; then
     v=$(grep -oE 'dsh web [0-9][^ ]*|@deepseek-ai/dsh@[0-9][^ ]*' "$LOG" | tail -1) || v=""
   fi
@@ -268,6 +267,257 @@ cmd_channel() {
   plutil -lint "$PLIST" >/dev/null || { echo "plist 损坏，请手动检查 $PLIST" >&2; exit 1; }
   echo "通道 ${cur} → ${1}，重启服务生效…（首次解析新通道要拉依赖，可能慢几十秒）"
   reload_and_wait "新通道 ${1}，"
+}
+
+# ---- upgrade：把当前通道升到远端最新版 ----
+# 关键坑：pnpm dlx 解析 @latest 读本机 registry 元数据缓存，镜像滞后副本 + etag 304
+# 会让 dist-tags 快照永不刷新 → 重启后仍是旧版（假升级，2026-09-05 实锤）。
+# 所以流程必须是：清缓存 → 预下载并用 --version 验证目标版本可运行 → 再重启 → 最后回读运行版本校验。
+
+# 务实 semver 比较（dsh 版本形态 MAJOR.MINOR.PATCH[-预发布]）。
+# 不用 sort -V：它认为 0.1.5-rc.3 > 0.1.5，而正式版应大于同号预发布。
+# 返回 0 相等 / 1 v1 更新 / 2 v2 更新
+ver_cmp() {
+  local v1="$1" v2="$2" n1 n2 p1 p2 hi
+  [ "$v1" = "$v2" ] && return 0
+  n1="${v1%%-*}"; n2="${v2%%-*}"; p1=""; p2=""
+  case "$v1" in *-*) p1="${v1#*-}" ;; esac
+  case "$v2" in *-*) p2="${v2#*-}" ;; esac
+  if [ "$n1" != "$n2" ]; then
+    hi=$(printf '%s\n%s\n' "$n1" "$n2" | sort -V | tail -1)
+    if [ "$hi" = "$n1" ]; then return 1; else return 2; fi
+  fi
+  # 数字段相同：正式版 > 预发布；同为预发布按标识比较（rc.10>rc.2、alpha<beta<rc）
+  if [ -z "$p1" ] && [ -n "$p2" ]; then return 1; fi
+  if [ -n "$p1" ] && [ -z "$p2" ]; then return 2; fi
+  hi=$(printf '%s\n%s\n' "$p1" "$p2" | sort -V | tail -1)
+  if [ "$hi" = "$p1" ]; then return 1; else return 2; fi
+}
+
+# 当前监听进程实际运行的 dsh 版本（读进程命令行里 dlx 缓存目录的 package.json）；读不到输出空
+running_version() {
+  local pid cmd dsh_dir
+  pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || pid=""
+  [ -n "$pid" ] || return 0
+  cmd=$(ps -o command= -p "$pid" 2>/dev/null) || cmd=""
+  [ -n "$cmd" ] || return 0
+  dsh_dir=$(grep -oE '/[^ ]*/@deepseek-ai/dsh[^/ ]*' <<<"$cmd" | head -1) || dsh_dir=""
+  [ -n "$dsh_dir" ] || return 0
+  sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$dsh_dir/package.json" 2>/dev/null | head -1
+}
+
+# 查 dist-tags（每行 tag:版本）。$1=registry，空则用配置的。
+# 用临时 npm cache 目录绕开 npm 自身缓存，确保拿到 registry 当下真实的 dist-tags
+npm_dist_tags() {
+  local tmp out
+  tmp=$(mktemp -d 2>/dev/null) || return 1
+  if [ -n "${1:-}" ]; then
+    out=$(npm view @deepseek-ai/dsh dist-tags --json --registry "$1" --cache "$tmp" 2>/dev/null) || out=""
+  else
+    out=$(npm view @deepseek-ai/dsh dist-tags --json --cache "$tmp" 2>/dev/null) || out=""
+  fi
+  rm -rf "$tmp"
+  printf '%s' "$out" | tr -d ' \n"' | tr ',{}' '\n' | grep ':' || true
+}
+
+tag_version() { printf '%s\n' "$1" | grep -E "^$2:" | head -1 | cut -d: -f2- || true; }
+
+# 清 pnpm 给 @deepseek-ai/dsh 缓存的 registry 元数据（三个 metadata 目录、任意 registry 域名）。
+# 只删 dsh 自己的 jsonl，别的包不动；输出删除的文件数
+purge_pnpm_metadata() {
+  find "$HOME/Library/Caches/pnpm" -type f -path '*metadata*/@deepseek-ai/dsh.jsonl' -print -delete 2>/dev/null | wc -l | tr -d ' '
+}
+
+# 本命令是否运行在 dsh 服务自己的进程树里（在 dsh 网页会话内跑 upgrade 时，重启会顺带杀掉本会话）
+in_service_tree() {
+  local listen_pid p
+  listen_pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || listen_pid=""
+  [ -n "$listen_pid" ] || return 1
+  p=$$
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ') || return 1
+    [ -n "$p" ] || return 1
+    [ "$p" = "1" ] && return 1
+    [ "$p" = "$listen_pid" ] && return 0
+  done
+  return 1
+}
+
+# launchd 内存里跑的 argv 是否已是某通道。手改 plist 未重载时两者不一致，
+# 而 kickstart -k 用的是内存里的旧 argv，必须改用 bootout+bootstrap 才会重读 plist
+launchd_argv_has() {
+  launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -q "@deepseek-ai/dsh@$1"
+}
+
+# dsh-ctl upgrade            检查并升级（npmjs 官方定目标 → 清缓存 → 预下载验证 → 重启 → 校验）
+# dsh-ctl upgrade --force    目标不比当前新也执行（重装 / 把服务拉回通道目标版）
+# dsh-ctl upgrade <版本号>   升/降到指定版本（plist 通道随之钉住；回滚动通道用 channel latest）
+cmd_upgrade() {
+  local force=0 arg="${1:-}" extra="${2:-}"
+  case "$extra" in
+    --force) force=1 ;;
+    "") ;;
+    *) echo "用法: dsh-ctl upgrade [--force] [版本号]" >&2; exit 1 ;;
+  esac
+  case "$arg" in
+    --force) force=1; arg="" ;;
+    -h|--help) echo "用法: dsh-ctl upgrade [--force] [版本号]"; return 0 ;;
+    -*) echo "未知参数: ${arg}" >&2; exit 1 ;;
+  esac
+  if [ -n "$arg" ]; then
+    case "$arg" in
+      [0-9]*) ;;
+      *) echo "upgrade 只接受具体版本号（如 0.1.6）；切通道用 dsh-ctl channel" >&2; exit 1 ;;
+    esac
+    case "$arg" in
+      *[!0-9a-zA-Z._-]*) echo "版本号不合法: ${arg}" >&2; exit 1 ;;
+    esac
+  fi
+
+  [ -f "$PLIST" ] || { echo "还没部署服务，先: dsh-ctl install && dsh-ctl start" >&2; exit 1; }
+  detect_pm || { echo "未找到 pnpm / yarn(2+) / npx，无法预下载。先 dsh-ctl doctor" >&2; exit 1; }
+
+  local cur target tags t run_v rc=0
+  cur="$(current_channel)"; cur="${cur:-latest}"
+
+  echo "== dsh-ctl upgrade =="
+
+  # 1) 定目标版本
+  if [ -n "$arg" ]; then
+    target="$arg"
+  else
+    # 官方 npmjs 优先（本机 registry 可能是滞后镜像），都失败才报错
+    tags="$(npm_dist_tags "https://registry.npmjs.org")"
+    [ -n "$tags" ] || tags="$(npm_dist_tags "")"
+    if [ -z "$tags" ]; then
+      echo "查不到远端 dist-tags（npmjs 官方与本机 registry 都失败），检查网络/代理后重试" >&2
+      exit 1
+    fi
+    t="$(tag_version "$tags" "$cur")"
+    if [ -z "$t" ]; then
+      case "$cur" in
+        [0-9]*)
+          echo "当前通道钉在版本 ${cur}，upgrade 不动钉定版本。" >&2
+          echo "跟回最新: dsh-ctl channel latest；或指定版本: dsh-ctl upgrade <版本号>" >&2 ;;
+        *)
+          echo "通道 ${cur} 不在远端 dist-tags 里（可能已下线）: $(printf '%s' "$tags" | tr '\n' ' ')" >&2 ;;
+      esac
+      exit 1
+    fi
+    target="$t"
+  fi
+
+  # 2) 对比当前运行版本
+  run_v="$(running_version)" || run_v=""
+  if [ -n "$run_v" ]; then
+    ver_cmp "$target" "$run_v" || rc=$?
+    if [ "$rc" = "0" ]; then
+      echo "已是最新: ${run_v}（通道 ${cur} = 远端 ${target}），无需升级"
+      return 0
+    fi
+    if [ "$rc" = "2" ] && [ "$force" != "1" ]; then
+      echo "目标 ${target} 不比当前运行的 ${run_v} 新，默认不动。" >&2
+      echo "确要回退/对齐到该版本: dsh-ctl upgrade ${target} --force" >&2
+      exit 1
+    fi
+  fi
+  echo "通道: ${cur}   当前运行: ${run_v:-未知}   目标: ${target}"
+
+  # 3) 清元数据缓存，防 dlx 解析到旧快照（非 pnpm 无此坑）
+  if [ "${PM_BIN##*/}" = "pnpm" ]; then
+    echo "[1/4] 清理 pnpm 元数据缓存（防 @latest 假升级）… 删除 $(purge_pnpm_metadata) 个文件"
+  else
+    echo "[1/4] 包管理器是 ${PM_BIN##*/}，跳过 pnpm 元数据缓存清理"
+  fi
+
+  # 4) 预下载 + 用 --version 验证（失败即中止，正在运行的服务不受影响）
+  echo "[2/4] 预下载并验证 ${target}（首次拉新版本依赖可能要等一会）…"
+  local errlog pre_v
+  errlog="$(mktemp)"
+  if ! pre_v=$("$PM_BIN" "${PM_ARGS[@]}" "@deepseek-ai/dsh@${target}" --version 2>"$errlog"); then
+    echo "预下载/执行失败，已中止（服务未受影响）。错误摘要:" >&2
+    tail -5 "$errlog" >&2
+    rm -f "$errlog"
+    exit 1
+  fi
+  rm -f "$errlog"
+  pre_v="$(printf '%s\n' "$pre_v" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[-0-9A-Za-z.]*' | tail -1)" || pre_v=""
+  if [ "$pre_v" != "$target" ]; then
+    echo "预下载后版本对不上: 期望 ${target}，实际 ${pre_v:-空}（registry 滞后？）。已中止，服务未受影响" >&2
+    exit 1
+  fi
+  echo "      ✓ ${target} 已就绪并验证可运行（缓存已预热，重启秒起）"
+
+  # 5) 指定版本：把 plist 通道钉到该版本（重启才真正换版本）
+  if [ -n "$arg" ] && [ "$arg" != "$cur" ]; then
+    sed -i '' "s|@deepseek-ai/dsh@${cur}</string>|@deepseek-ai/dsh@${target}</string>|" "$PLIST"
+    plutil -lint "$PLIST" >/dev/null || { echo "plist 损坏，请手动检查 $PLIST" >&2; exit 1; }
+    echo "      plist 通道 ${cur} → ${target}（已钉住；回滚动通道: dsh-ctl channel latest）"
+  fi
+
+  # 6) 重启生效
+  if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    echo "[3/4] LaunchAgent 未加载，跳过重启（已预热并写好配置，下次 dsh-ctl start 即运行 ${target}）"
+    echo "[4/4] 跳过（服务未运行）"
+    return 0
+  fi
+  local pin_switch=0 need_reload=0
+  [ -n "$arg" ] && [ "$arg" != "$cur" ] && pin_switch=1
+  # plist 改了（指定版本）或 launchd 内存 argv 与 plist 不一致 → 必须重载而非 kickstart
+  if [ "$pin_switch" = "1" ] || ! launchd_argv_has "$cur"; then need_reload=1; fi
+  if in_service_tree; then
+    # 在 dsh 网页会话内执行：重启会切断本会话进程树，改为延时异步重启并先交代后事
+    echo "[3/4] 检测到在 dsh 网页会话内执行：3 秒后异步重启（本会话将断线）"
+    echo "      页面断开后稍等几秒刷新重连；随后 dsh-ctl status 看版本、dsh-ctl url 拿新地址"
+    if [ "$need_reload" = "1" ]; then
+      ( sleep 3; launchctl bootout "$DOMAIN/$LABEL"; sleep 1; launchctl bootstrap "$DOMAIN" "$PLIST" ) >/dev/null 2>&1 &
+    else
+      ( sleep 3; launchctl kickstart -k "$DOMAIN/$LABEL" ) >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
+    echo "[4/4] 校验改在重连后进行（目标版本 ${target}）"
+    echo "      若页面迟迟不回来: dsh-ctl start（plist 已写好，会直接拉 ${target}）"
+    return 0
+  fi
+  if [ "$need_reload" = "1" ]; then
+    if [ "$pin_switch" != "1" ]; then
+      echo "      注意: launchd 内存 argv 与 plist 通道 ${cur} 不一致（多半是手改过 plist 没重载），改用 bootout+bootstrap"
+    fi
+    echo "[3/4] 重载服务（bootout+bootstrap，让 plist 生效）…"
+    launchctl bootout "$DOMAIN/$LABEL"; sleep 1
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+  else
+    echo "[3/4] 重启服务（kickstart -k）…"
+    launchctl kickstart -k "$DOMAIN/$LABEL"
+  fi
+
+  # 7) 校验：等到监听进程真换成目标版本（dlx 已预热，正常几秒；给足 90s 窗口）
+  echo "[4/4] 等待并校验新版本上线…"
+  local v="" i url=""
+  for i in $(seq 1 45); do
+    v="$(running_version)" || v=""
+    [ "$v" = "$target" ] && break
+    sleep 2
+  done
+  if [ "$v" != "$target" ]; then
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
+      echo "重启后运行的仍是 ${v:-未知}（期望 ${target}）。" >&2
+      echo "常见原因: registry 镜像的 ${cur} 还没同步到 ${target}（稍后重试），或 runtime 解析异常" >&2
+      echo "排查: dsh-ctl status 看通道/版本；必要时 dsh-ctl channel ${cur} 强制重载后重试" >&2
+    else
+      echo "服务未在端口 ${PORT} 监听，可能启动失败。最近日志:" >&2
+      tail -15 "$LOG" 2>/dev/null >&2
+      echo "排查: dsh-ctl status / dsh-ctl log" >&2
+    fi
+    exit 1
+  fi
+  for i in 1 2 3 4 5; do
+    url="$(token_url)"
+    [ -n "$url" ] && break
+    sleep 2
+  done
+  echo "升级完成: ${run_v:-未知} → ${target}"
+  if [ -n "$url" ]; then echo "新 URL: ${url}"; else echo "新 URL 稍后取: dsh-ctl url"; fi
 }
 
 cmd_autostart() {
@@ -392,6 +642,7 @@ case "${1:-status}" in
   install) cmd_install ;;
   port)    cmd_port "${2:-}" ;;
   channel) cmd_channel "${2:-}" ;;
+  upgrade) cmd_upgrade "${2:-}" "${3:-}" ;;
   doctor)  cmd_doctor ;;
   autostart) cmd_autostart "${2:-}" ;;
   help|-h|--help) usage 0 ;;
