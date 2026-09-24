@@ -18,13 +18,13 @@ Mac 本机 dsh web 服务的命令行控制面
 - **launchd 常驻** —— dsh web 由 LaunchAgent 持有，终端关了、App 退了服务都在，崩溃自动拉回
 - **一条命令拿访问地址** —— `dsh-ctl open` 直接用默认浏览器打开带 token 的 URL，不用去日志里翻
 - **改端口不用手编 plist** —— `dsh-ctl port 3090` 自动改配置、重启服务、打印新地址
-- **升级不被缓存坑** —— `dsh-ctl upgrade` 会清掉 pnpm 的元数据缓存再重启，`@latest` 解析不会被旧快照钉死
+- **不挑包管理器** —— 安装时自动探测 pnpm / yarn / npx，装了哪个用哪个，都没有会明确报错
 - **接管已有进程** —— 之前手动起的 dsh web，`dsh-ctl adopt` 一次性切到 launchd 接管
 - **单文件** —— 一个 Bash 脚本，无依赖，读一遍就能放心用
 
 ## 🚀 快速开始
 
-要求：macOS + [pnpm](https://pnpm.io)。
+要求：macOS + pnpm / yarn 2+ / npx 任一（自动探测，推荐 pnpm）。
 
 ### 1. 安装
 
@@ -73,7 +73,6 @@ dsh-ctl adopt
 | `log` | tail -f 服务日志 |
 | `start` / `stop` | 启动 / 真停（stop 不会被拉回） |
 | `restart` | 重启（kickstart -k） |
-| `upgrade` | 清 pnpm 元数据缓存后重启，重新解析 `@latest` |
 | `adopt` | 把宿主手动拉起的进程切到 launchd 接管 |
 | `install` | 写入/修复 LaunchAgent plist（幂等） |
 

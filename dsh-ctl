@@ -12,7 +12,6 @@
 #   dsh-ctl start      启动（bootstrap LaunchAgent）
 #   dsh-ctl stop       真停（bootout，不会被拉回）
 #   dsh-ctl restart    重启（kickstart -k）
-#   dsh-ctl upgrade    清 pnpm filtered 元数据缓存后重启（dlx 重新解析 @latest）
 #   dsh-ctl adopt      把当前宿主拉起的 3080 切换到 launchd 接管（一次性迁移）
 #   dsh-ctl install    写入/修复 LaunchAgent plist（幂等）
 #   dsh-ctl port [N]   查看端口；port N 改端口（重写 plist + 重启生效）
@@ -26,12 +25,24 @@ LOG="$HOME/Library/Logs/dsh-web.log"
 PORT="${DSH_CTL_PORT:-$(grep -A1 -m1 -- '--port</string>' "$PLIST" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)}"
 : "${PORT:=3080}"
 DOMAIN="gui/$(id -u)"
-# 2026-09-05 定位的坑：pnpm 11 dlx 解析 @latest 读 metadata-full-filtered 快照，
-# etag 304 会把 dist-tags 钉死在旧版本；升级前必须清。
-NPM_MIRROR_META="$HOME/Library/Caches/pnpm/v11/metadata-full-filtered/registry.npmmirror.com/@deepseek-ai/dsh.jsonl"
-NPM_OFFICIAL_META="$HOME/Library/Caches/pnpm/v11/metadata-full-filtered/registry.npmjs.org/@deepseek-ai/dsh.jsonl"
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# 包管理器探测：pnpm > yarn(2+) > npx。launchd 不走 shell，必须解析成绝对路径。
+PM_BIN="" PM_ARGS=()
+detect_pm() {
+  local bin
+  if bin="$(command -v pnpm 2>/dev/null)"; then
+    PM_BIN="$bin"; PM_ARGS=(--config.dangerouslyAllowAllBuilds=true dlx); return 0
+  fi
+  if bin="$(command -v yarn 2>/dev/null)" && ! yarn --version 2>/dev/null | grep -q '^1\.'; then
+    PM_BIN="$bin"; PM_ARGS=(dlx); return 0
+  fi
+  if bin="$(command -v npx 2>/dev/null)"; then
+    PM_BIN="$bin"; PM_ARGS=(-y); return 0
+  fi
+  return 1
+}
 
 need_job() {
   if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
@@ -101,14 +112,6 @@ cmd_stop() {
 
 cmd_restart() { need_job; launchctl kickstart -k "$DOMAIN/$LABEL"; echo "已重启（kickstart -k）"; }
 
-cmd_upgrade() {
-  for f in "$NPM_MIRROR_META" "$NPM_OFFICIAL_META"; do
-    if [ -f "$f" ]; then rm -f "$f"; echo "cleared: ${f#$HOME/}"; fi
-  done
-  cmd_restart
-  echo "dlx 将重新解析 @deepseek-ai/dsh@latest（npmmirror 滞后时可等几分钟再试）"
-}
-
 cmd_port() {
   if [ -z "${1:-}" ]; then
     echo "当前端口: ${PORT}"
@@ -142,6 +145,20 @@ cmd_port() {
 }
 
 cmd_install() {
+  detect_pm || {
+    echo "未找到 pnpm / yarn(2+) / npx 任一包管理器。先安装其一，例如:" >&2
+    echo "  curl -fsSL https://get.pnpm.io/install.sh | sh -" >&2
+    exit 1
+  }
+  echo "包管理器: ${PM_BIN} ${PM_ARGS[*]}"
+  # launchd 无 shell 环境，PATH 需覆盖 node 与包管理器所在目录
+  local node_dir pm_dir plist_args=""
+  pm_dir="$(dirname "$PM_BIN")"
+  node_dir="$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/node)")"
+  for a in "${PM_ARGS[@]}" "@deepseek-ai/dsh@latest" "web" "--no-open" "--port" "$PORT"; do
+    plist_args+="        <string>${a}</string>
+"
+  done
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
   cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -152,19 +169,12 @@ cmd_install() {
     <string>${LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${HOME}/Library/pnpm/pnpm</string>
-        <string>--config.dangerouslyAllowAllBuilds=true</string>
-        <string>dlx</string>
-        <string>@deepseek-ai/dsh@latest</string>
-        <string>web</string>
-        <string>--no-open</string>
-        <string>--port</string>
-        <string>${PORT}</string>
-    </array>
+        <string>${PM_BIN}</string>
+        ${plist_args}    </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${HOME}/.hermes/node/bin:${HOME}/Library/pnpm:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>${node_dir}:${pm_dir}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>${HOME}</string>
     </dict>
@@ -228,7 +238,6 @@ case "${1:-status}" in
   start)   cmd_start ;;
   stop)    cmd_stop ;;
   restart) cmd_restart ;;
-  upgrade) cmd_upgrade ;;
   adopt)   cmd_adopt ;;
   install) cmd_install ;;
   port)    cmd_port "${2:-}" ;;

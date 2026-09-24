@@ -18,13 +18,13 @@ One command to manage a launchd-supervised dsh web · auto-restart on crash · c
 - **launchd-supervised** — dsh web is owned by a LaunchAgent; close the terminal, quit the app, the service stays. Crashes are auto-restarted
 - **One command for the URL** — `dsh-ctl open` opens the token-authenticated URL in your default browser, no digging through logs
 - **Change ports without editing plists** — `dsh-ctl port 3090` rewrites the config, restarts the service, and prints the new URL
-- **Upgrades not blocked by cache** — `dsh-ctl upgrade` clears pnpm's metadata cache before restarting, so `@latest` resolution isn't pinned to a stale snapshot
+- **Works with any package manager** — install-time detection for pnpm / yarn / npx; uses whichever you have, errors clearly if none
 - **Adopt existing processes** — started dsh web by hand earlier? `dsh-ctl adopt` switches it to launchd in one shot
 - **Single file** — one Bash script, zero dependencies, readable in one pass
 
 ## 🚀 Quick Start
 
-Requires: macOS + [pnpm](https://pnpm.io).
+Requires: macOS + any of pnpm / yarn 2+ / npx (auto-detected; pnpm recommended).
 
 ### 1. Install
 
@@ -73,7 +73,6 @@ This kills the existing process chain and hands it to launchd; reconnect your br
 | `log` | tail -f the service log |
 | `start` / `stop` | Start / real stop (stop won't be respawned) |
 | `restart` | Restart (kickstart -k) |
-| `upgrade` | Clear pnpm metadata cache and restart, re-resolving `@latest` |
 | `adopt` | Hand a manually-started process over to launchd |
 | `install` | Write/repair the LaunchAgent plist (idempotent) |
 
