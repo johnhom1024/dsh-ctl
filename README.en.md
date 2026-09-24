@@ -30,10 +30,10 @@ Requires: macOS + any of pnpm / yarn 2+ / npx (auto-detected; pnpm recommended).
 
 ```bash
 git clone https://github.com/johnhom1024/dsh-ctl.git
-ln -s "$(pwd)/dsh-ctl/dsh-ctl" ~/.local/bin/dsh-ctl
+cd dsh-ctl && ./install.sh
 ```
 
-(If `~/.local/bin` is not on your PATH, pick a directory that is.)
+The installer runs a quick environment check (node / package manager) and tells you what's missing.
 
 ### 2. Deploy the service
 
@@ -48,7 +48,7 @@ dsh-ctl start     # starts dsh web under launchd
 dsh-ctl open
 ```
 
-Your browser opens `http://127.0.0.1:3080/?token=...` — ready to use.
+Your browser opens `http://127.0.0.1:3080/?token=...` — ready to use. If anything goes wrong, run `dsh-ctl doctor` for a step-by-step health check.
 
 <details>
 <summary>Already running dsh web by hand and want to migrate?</summary>
@@ -75,6 +75,7 @@ This kills the existing process chain and hands it to launchd; reconnect your br
 | `restart` | Restart (kickstart -k) |
 | `adopt` | Hand a manually-started process over to launchd |
 | `install` | Write/repair the LaunchAgent plist (idempotent) |
+| `doctor` | Health check: node / package manager / plist / launchd / port / token |
 
 The `DSH_CTL_PORT` environment variable overrides the port (default: read from the plist, falling back to 3080).
 

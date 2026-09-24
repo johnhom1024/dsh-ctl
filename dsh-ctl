@@ -15,6 +15,7 @@
 #   dsh-ctl adopt      把当前宿主拉起的 3080 切换到 launchd 接管（一次性迁移）
 #   dsh-ctl install    写入/修复 LaunchAgent plist（幂等）
 #   dsh-ctl port [N]   查看端口；port N 改端口（重写 plist + 重启生效）
+#   dsh-ctl doctor     环境自检（node/包管理器/plist/launchd/端口/token）
 
 set -euo pipefail
 
@@ -26,7 +27,66 @@ PORT="${DSH_CTL_PORT:-$(grep -A1 -m1 -- '--port</string>' "$PLIST" 2>/dev/null |
 : "${PORT:=3080}"
 DOMAIN="gui/$(id -u)"
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# doctor：逐项体检，OK/WARN/FAIL 一目了然；返回码 0=全绿 1=有 FAIL
+cmd_doctor() {
+  local fail=0
+  echo "== dsh-ctl doctor =="
+
+  if command -v node >/dev/null 2>&1; then
+    echo "[OK]   node $(node --version) ($(command -v node))"
+  else
+    echo "[FAIL] node 未安装"; fail=1
+  fi
+
+  if detect_pm; then
+    echo "[OK]   包管理器: ${PM_BIN} ${PM_ARGS[*]}"
+  else
+    echo "[FAIL] 未找到 pnpm / yarn 2+ / npx"; fail=1
+  fi
+
+  if [ -f "$PLIST" ]; then
+    if plutil -lint "$PLIST" >/dev/null 2>&1; then
+      echo "[OK]   plist 合法 ${PLIST}"
+    else
+      echo "[FAIL] plist 损坏: $PLIST"; fail=1
+    fi
+  else
+    echo "[WARN] plist 不存在（还没 dsh-ctl install？）"
+  fi
+
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    echo "[OK]   launchd job 已加载"
+  else
+    echo "[WARN] launchd job 未加载（还没 dsh-ctl start？）"
+  fi
+
+  if pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) && [ -n "$pid" ]; then
+    local p="$pid" ok=0
+    for _ in 1 2 3 4 5; do
+      p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+      [ -z "$p" ] && break
+      [ "$p" = "1" ] && { ok=1; break; }
+    done
+    if [ "$ok" = "1" ]; then
+      echo "[OK]   端口 $PORT 监听中，归属 launchd"
+    else
+      echo "[WARN] 端口 $PORT 监听中但非 launchd 归属（考虑 dsh-ctl adopt）"
+    fi
+  else
+    echo "[WARN] 端口 $PORT 无监听（服务没起来？dsh-ctl status 看详情）"
+  fi
+
+  if [ -n "$(token_url)" ]; then
+    echo "[OK]   token URL 可从日志解析"
+  else
+    echo "[WARN] 日志里没有 token URL（服务没起来或日志被清）"
+  fi
+
+  if [ "$fail" = "1" ]; then echo "结论: 有 FAIL 项，先修上面的 [FAIL]"; exit 1; fi
+  echo "结论: 基础环境正常"
+}
 
 # 包管理器探测：pnpm > yarn(2+) > npx。launchd 不走 shell，必须解析成绝对路径。
 PM_BIN="" PM_ARGS=()
@@ -253,6 +313,7 @@ case "${1:-status}" in
   adopt)   cmd_adopt ;;
   install) cmd_install ;;
   port)    cmd_port "${2:-}" ;;
+  doctor)  cmd_doctor ;;
   help|-h|--help) usage 0 ;;
   *) echo "未知命令: $1" >&2; usage 1 ;;
 esac

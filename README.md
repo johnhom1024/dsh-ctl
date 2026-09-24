@@ -30,10 +30,10 @@ Mac 本机 dsh web 服务的命令行控制面
 
 ```bash
 git clone https://github.com/johnhom1024/dsh-ctl.git
-ln -s "$(pwd)/dsh-ctl/dsh-ctl" ~/.local/bin/dsh-ctl
+cd dsh-ctl && ./install.sh
 ```
 
-（`~/.local/bin` 不在 PATH 的话，换成一个在 PATH 里的目录。）
+装完自动做环境预检（node / 包管理器），缺什么会告诉你。
 
 ### 2. 部署服务
 
@@ -48,7 +48,7 @@ dsh-ctl start     # 启动，dsh web 跑在 launchd 下
 dsh-ctl open
 ```
 
-浏览器会打开 `http://127.0.0.1:3080/?token=...`，开箱即用。
+浏览器会打开 `http://127.0.0.1:3080/?token=...`，开箱即用。遇到问题先跑 `dsh-ctl doctor`，逐项体检告诉你差在哪。
 
 <details>
 <summary>已有手动起的 dsh web，想迁移过来</summary>
@@ -75,6 +75,7 @@ dsh-ctl adopt
 | `restart` | 重启（kickstart -k） |
 | `adopt` | 把宿主手动拉起的进程切到 launchd 接管 |
 | `install` | 写入/修复 LaunchAgent plist（幂等） |
+| `doctor` | 环境自检：node / 包管理器 / plist / launchd / 端口 / token |
 
 环境变量 `DSH_CTL_PORT` 可临时覆盖端口（默认读 plist，plist 缺省 3080）。
 
