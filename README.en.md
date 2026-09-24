@@ -15,7 +15,7 @@ One command to manage a launchd-supervised dsh web · auto-restart on crash · c
 
 ## ✨ Features
 
-- **launchd-supervised** — dsh web is owned by a LaunchAgent; close the terminal, quit the app, the service stays. Crashes are auto-restarted
+- **launchd-supervised** — dsh web is owned by a LaunchAgent; close the terminal, quit the app, the service stays. Crashes are auto-restarted; auto-starts at login by default, `dsh-ctl autostart off` to disable
 - **One command for the URL** — `dsh-ctl open` opens the token-authenticated URL in your default browser, no digging through logs
 - **Change ports without editing plists** — `dsh-ctl port 3090` rewrites the config, restarts the service, and prints the new URL
 - **Works with any package manager** — install-time detection for pnpm / yarn / npx; uses whichever you have, errors clearly if none
@@ -70,6 +70,8 @@ This kills the existing process chain and hands it to launchd; reconnect your br
 | `open` | Open the token URL in the default browser |
 | `port` | Show the current port |
 | `port N` | Change port: rewrites plist + restarts + prints the new URL |
+| `channel` | Show/switch release channel (latest / next / exact version) |
+| `autostart` | Auto-start at login toggle (`autostart on/off`, default on) |
 | `log` | tail -f the service log |
 | `start` / `stop` | Start / real stop (stop won't be respawned) |
 | `restart` | Restart (kickstart -k) |

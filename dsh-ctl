@@ -17,6 +17,7 @@
 #   dsh-ctl port [N]   查看端口；port N 改端口（重写 plist + 重启生效）
 #   dsh-ctl channel    查看/切换发布通道（latest / next / 具体版本号）
 #   dsh-ctl doctor     环境自检（node/包管理器/plist/launchd/端口/token）
+#   dsh-ctl autostart [on|off]  开机自启开关（默认 on）
 
 set -euo pipefail
 
@@ -28,7 +29,7 @@ PORT="${DSH_CTL_PORT:-$(grep -A1 -m1 -- '--port</string>' "$PLIST" 2>/dev/null |
 : "${PORT:=3080}"
 DOMAIN="gui/$(id -u)"
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # doctor：逐项体检，OK/WARN/FAIL 一目了然；返回码 0=全绿 1=有 FAIL
 cmd_doctor() {
@@ -269,6 +270,30 @@ cmd_channel() {
   reload_and_wait "新通道 ${1}，"
 }
 
+cmd_autostart() {
+  local cur="off"
+  if [ -f "$PLIST" ] && /usr/libexec/PlistBuddy -c 'Print :RunAtLoad' "$PLIST" 2>/dev/null | grep -q true; then
+    cur="on"
+  fi
+  local want="${1:-}"
+  [ -z "$want" ] && { echo "开机自启: ${cur}（dsh-ctl autostart on/off 切换）"; return 0; }
+  case "$want" in on|off) ;; *) echo "用法: dsh-ctl autostart [on|off]（当前 ${cur}）" >&2; return 1 ;; esac
+  [ "$want" = "$cur" ] && { echo "开机自启已是 ${want}"; return 0; }
+  [ -f "$PLIST" ] || cmd_install
+  # PlistBuddy 只认 true/false，不认 on/off
+  local val="false"; [ "$want" = "on" ] && val="true"
+  /usr/libexec/PlistBuddy -c "Set :RunAtLoad ${val}" "$PLIST"
+  plutil -lint "$PLIST" >/dev/null || { echo "plist 损坏，请手动检查 $PLIST" >&2; exit 1; }
+  echo "开机自启 ${cur} → ${want}"
+  # RunAtLoad 只在加载时生效，重载让 launchd 立即感知
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$DOMAIN/$LABEL"; sleep 1; launchctl bootstrap "$DOMAIN" "$PLIST"
+    echo "（job 已重载）"
+  else
+    echo "（job 未加载，下次 start 生效）"
+  fi
+}
+
 cmd_install() {
   detect_pm || {
     echo "未找到 pnpm / yarn(2+) / npx 任一包管理器。先安装其一，例如:" >&2
@@ -368,6 +393,7 @@ case "${1:-status}" in
   port)    cmd_port "${2:-}" ;;
   channel) cmd_channel "${2:-}" ;;
   doctor)  cmd_doctor ;;
+  autostart) cmd_autostart "${2:-}" ;;
   help|-h|--help) usage 0 ;;
   *) echo "未知命令: $1" >&2; usage 1 ;;
 esac

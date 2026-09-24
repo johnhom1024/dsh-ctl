@@ -15,7 +15,7 @@ Mac 本机 dsh web 服务的命令行控制面
 
 ## ✨ 特性
 
-- **launchd 常驻** —— dsh web 由 LaunchAgent 持有，终端关了、App 退了服务都在，崩溃自动拉回
+- **launchd 常驻** —— dsh web 由 LaunchAgent 持有，终端关了、App 退了服务都在，崩溃自动拉回；默认开机自启，`dsh-ctl autostart off` 可关
 - **一条命令拿访问地址** —— `dsh-ctl open` 直接用默认浏览器打开带 token 的 URL，不用去日志里翻
 - **改端口不用手编 plist** —— `dsh-ctl port 3090` 自动改配置、重启服务、打印新地址
 - **不挑包管理器** —— 安装时自动探测 pnpm / yarn / npx，装了哪个用哪个，都没有会明确报错
@@ -70,6 +70,8 @@ dsh-ctl adopt
 | `open` | 默认浏览器打开 token URL |
 | `port` | 查看当前端口 |
 | `port N` | 改端口：改 plist + 重启 + 打印新 URL |
+| `channel` | 查看/切换发布通道（latest / next / 具体版本号） |
+| `autostart` | 开机自启开关（`autostart on/off`，默认 on） |
 | `log` | tail -f 服务日志 |
 | `start` / `stop` | 启动 / 真停（stop 不会被拉回） |
 | `restart` | 重启（kickstart -k） |
