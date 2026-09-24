@@ -15,6 +15,7 @@
 #   dsh-ctl adopt      把当前宿主拉起的 3080 切换到 launchd 接管（一次性迁移）
 #   dsh-ctl install    写入/修复 LaunchAgent plist（幂等）
 #   dsh-ctl port [N]   查看端口；port N 改端口（重写 plist + 重启生效）
+#   dsh-ctl channel    查看/切换发布通道（latest / next / 具体版本号）
 #   dsh-ctl doctor     环境自检（node/包管理器/plist/launchd/端口/token）
 
 set -euo pipefail
@@ -27,7 +28,7 @@ PORT="${DSH_CTL_PORT:-$(grep -A1 -m1 -- '--port</string>' "$PLIST" 2>/dev/null |
 : "${PORT:=3080}"
 DOMAIN="gui/$(id -u)"
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # doctor：逐项体检，OK/WARN/FAIL 一目了然；返回码 0=全绿 1=有 FAIL
 cmd_doctor() {
@@ -118,7 +119,7 @@ cmd_status() {
   else
     echo "== launchd job: $LABEL 未加载 =="
   fi
-  echo "== 端口 $PORT =="
+  echo "== 端口 ${PORT}（通道 $(current_channel || echo latest)）=="
   if pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) && [ -n "$pid" ]; then
     ps -o pid,ppid,lstart,command -p "$pid" | cut -c1-160
     # pnpm dlx 模式下监听进程是 launchd 的孙进程，需沿父链向上找
@@ -140,7 +141,7 @@ cmd_status() {
   # dsh web 日志不打版本号；版本藏在监听进程的 dlx 缓存路径里
   local v=""
   if [ -n "${pid:-}" ]; then
-    v=$(ps -o command= -p "$pid" 2>/dev/null | grep -oE '@deepseek-ai\+dsh@[0-9.]+' | head -1 | sed 's/.*@//') || v=""
+    v=$(ps -o command= -p "$pid" 2>/dev/null | grep -oE '@deepseek-ai\+dsh@[0-9][0-9a-zA-Z.+-]+' | head -1 | sed 's/.*@//') || v=""
   fi
   if [ -f "$LOG" ] && [ -z "$v" ]; then
     v=$(grep -oE 'dsh web [0-9][^ ]*|@deepseek-ai/dsh@[0-9][^ ]*' "$LOG" | tail -1) || v=""
@@ -188,6 +189,29 @@ cmd_stop() {
 
 cmd_restart() { need_job; launchctl kickstart -k "$DOMAIN/$LABEL"; echo "已重启（kickstart -k）"; }
 
+# 改完 plist 后重载 launchd 并等服务起监听（kickstart -k 不重读 plist，必须 bootout+bootstrap）
+reload_and_wait() {
+  local hint="$1"
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$DOMAIN/$LABEL"
+    sleep 1
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+  else
+    echo "（LaunchAgent 未加载，下次 start 时生效）"
+    return 0
+  fi
+  for _ in 1 2 3 4 5 6 7 8; do
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q . && break
+    sleep 2
+  done
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
+    echo "端口 ${PORT} 已监听。${hint}URL："
+    grep -oE "http://127\.0\.0\.1:${PORT}/\?token=[^ \"']+" "$LOG" 2>/dev/null | tail -1 || true
+  else
+    echo "端口 ${PORT} 尚未监听（${hint}冷启动可能较慢），稍后用 dsh-ctl status / url 检查" >&2
+  fi
+}
+
 cmd_port() {
   if [ -z "${1:-}" ]; then
     echo "当前端口: ${PORT}"
@@ -204,20 +228,31 @@ cmd_port() {
   plutil -lint "$PLIST" >/dev/null || { echo "plist 损坏，请手动检查 $PLIST" >&2; exit 1; }
   PORT="$1"
   echo "plist 已改为端口 $1，重启服务生效…"
-  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-    launchctl bootout "$DOMAIN/$LABEL"
-    sleep 1
-    launchctl bootstrap "$DOMAIN" "$PLIST"
-  else
-    echo "（LaunchAgent 未加载，下次 start 时生效）"
+  reload_and_wait ""
+}
+
+current_channel() {
+  grep -oE '@deepseek-ai/dsh@[^<]+' "$PLIST" 2>/dev/null | head -1 | sed 's/.*@//' || true
+}
+
+cmd_channel() {
+  local cur; cur="$(current_channel)"
+  cur="${cur:-latest}"
+  if [ -z "${1:-}" ]; then
+    echo "当前通道: ${cur}"
+    return 0
   fi
-  sleep 4
-  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
-    echo "端口 $PORT 已监听。新 URL："
-    grep -oE "http://127\.0\.0\.1:${PORT}/\?token=[^ \"']+" "$LOG" 2>/dev/null | tail -1 || true
-  else
-    echo "端口 $PORT 尚未监听，稍后用 dsh-ctl status / url 检查" >&2
+  case "$1" in
+    *[!a-zA-Z0-9._-]*) echo "通道名不合法: $1（可用: latest / next / 具体版本号）" >&2; exit 1 ;;
+  esac
+  if [ "$1" = "$cur" ]; then
+    echo "通道已是 ${1}，无需修改"
+    return 0
   fi
+  sed -i '' "s|@deepseek-ai/dsh@${cur}</string>|@deepseek-ai/dsh@${1}</string>|" "$PLIST"
+  plutil -lint "$PLIST" >/dev/null || { echo "plist 损坏，请手动检查 $PLIST" >&2; exit 1; }
+  echo "通道 ${cur} → ${1}，重启服务生效…（首次解析新通道要拉依赖，可能慢几十秒）"
+  reload_and_wait "新通道 ${1}，"
 }
 
 cmd_install() {
@@ -317,6 +352,7 @@ case "${1:-status}" in
   adopt)   cmd_adopt ;;
   install) cmd_install ;;
   port)    cmd_port "${2:-}" ;;
+  channel) cmd_channel "${2:-}" ;;
   doctor)  cmd_doctor ;;
   help|-h|--help) usage 0 ;;
   *) echo "未知命令: $1" >&2; usage 1 ;;
