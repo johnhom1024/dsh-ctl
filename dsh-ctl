@@ -137,11 +137,15 @@ cmd_status() {
   else
     echo "  无进程监听"
   fi
-  if [ -f "$LOG" ]; then
-    # pipefail 下 grep 无匹配会杀退脚本，必须兜底
-    v=$(grep -oE 'dsh web [0-9][^ ]*|@deepseek-ai/dsh@[0-9][^ ]*' "$LOG" | tail -1) || v=""
-    echo "== 日志 == ${LOG}（版本提示: ${v:-未见}）"
+  # dsh web 日志不打版本号；版本藏在监听进程的 dlx 缓存路径里
+  local v=""
+  if [ -n "${pid:-}" ]; then
+    v=$(ps -o command= -p "$pid" 2>/dev/null | grep -oE '@deepseek-ai\+dsh@[0-9.]+' | head -1 | sed 's/.*@//') || v=""
   fi
+  if [ -f "$LOG" ] && [ -z "$v" ]; then
+    v=$(grep -oE 'dsh web [0-9][^ ]*|@deepseek-ai/dsh@[0-9][^ ]*' "$LOG" | tail -1) || v=""
+  fi
+  echo "== 版本 == ${v:-未见（服务未运行）}"
 }
 
 token_url() {
